@@ -147,6 +147,23 @@ public class SimpleTypesFactory {
    */
   private static Map<Integer, Type> _typesByCode = new Hashtable<Integer, Type>();
 
+  /**
+   * Lock-free lookup table for {@link #getBuiltInTypeName(int)}: built-in type code -&gt; type name.
+   * <p>
+   * The set of built-in types is fixed after {@link #loadTypesDefinitions()} has run, and the type
+   * codes form a small, bounded integer range (see {@link #INVALID_TYPE} ..
+   * {@link #ANYSIMPLETYPE_TYPE}). Resolving a name through {@link #_typesByCode} therefore means
+   * paying for {@link Integer} boxing plus a <em>synchronized</em> {@link Hashtable#get(Object)} on
+   * a single, process-wide monitor - a severe scalability bottleneck for callers that resolve type
+   * names in tight loops (for example bean introspection frameworks that treat
+   * {@code getBuiltInTypeName(int)} as a JavaBeans indexed getter).
+   * <p>
+   * The table is rebuilt by {@link #rebuildTypeNameTable()} from within the {@code synchronized}
+   * {@link #loadTypesDefinitions()} and published through a single volatile write, so readers can
+   * access it without any locking at all.
+   */
+  private static volatile String[] _typeNamesByCode = new String[0];
+
   /** The built-in schema, hopefully only temporary. */
   private static final Schema BUILD_IN_SCHEMA = new Schema();
 
@@ -217,13 +234,21 @@ public class SimpleTypesFactory {
 
   /**
    * Gets a built in type's name given its code.
+   * <p>
+   * This is a lock-free, allocation-free O(1) lookup backed by {@link #_typeNamesByCode}. It is
+   * behaviourally identical to a lookup in {@link #_typesByCode}: unknown or out-of-range codes
+   * (including {@link #INVALID_TYPE} and {@link #USER_TYPE}) yield {@code null}, known codes yield
+   * the very same {@link String} instance that {@code Type#getName()} would return.
+   *
+   * @param builtInTypeCode the built-in type code to resolve.
+   * @return the name of the built-in type, or {@code null} if the code is not a built-in type.
    */
   public String getBuiltInTypeName(final int builtInTypeCode) {
-    Type type = getType(builtInTypeCode);
-    if (type == null) {
+    final String[] names = _typeNamesByCode;
+    if (builtInTypeCode < 0 || builtInTypeCode >= names.length) {
       return null;
     }
-    return type.getName();
+    return names[builtInTypeCode];
   }
 
 
@@ -365,11 +390,45 @@ public class SimpleTypesFactory {
   }
 
   /**
-   * Gets the informations about the built in type which code is provided as input parameter. Loads
-   * the types definitions if they were not yet loaded
+   * Gets the informations about the built in type which code is provided as input parameter.
+   * <p>
+   * <b>Note:</b> this is the original, {@link Hashtable}-backed lookup. It is no longer used by
+   * {@link #getBuiltInTypeName(int)}, which is served from the lock-free {@link #_typeNamesByCode}
+   * table instead. It is kept package private so that tests can verify that both lookups stay
+   * equivalent, and for any caller that needs the full {@link Type} rather than just its name.
+   *
+   * @param typeCode the built-in type code to resolve.
+   * @return the {@link Type} for the given code, or {@code null} if the code is unknown.
    */
-  private Type getType(final int typeCode) {
+  Type getType(final int typeCode) {
     return _typesByCode.get(Integer.valueOf(typeCode));
+  }
+
+  /**
+   * (Re)builds the lock-free {@link #_typeNamesByCode} lookup table from {@link #_typesByCode}.
+   * <p>
+   * Must only be called while holding the monitor of {@link #loadTypesDefinitions()}. The freshly
+   * built array is never mutated afterwards and is handed over to readers through a single
+   * volatile write, which guarantees safe publication of its contents.
+   */
+  private static void rebuildTypeNameTable() {
+    int maxCode = 0;
+    for (Integer code : _typesByCode.keySet()) {
+      if (code.intValue() > maxCode) {
+        maxCode = code.intValue();
+      }
+    }
+
+    final String[] names = new String[maxCode + 1];
+    for (Map.Entry<Integer, Type> entry : _typesByCode.entrySet()) {
+      final int code = entry.getKey().intValue();
+      if (code >= 0) {
+        names[code] = entry.getValue().getName();
+      }
+    }
+
+    // -- single volatile write: safely publishes the fully initialised array.
+    _typeNamesByCode = names;
   }
 
   /**
@@ -405,6 +464,9 @@ public class SimpleTypesFactory {
         type.setSimpleType(createSimpleType(BUILD_IN_SCHEMA, type));
         _typesByCode.put(Integer.valueOf(type.getSimpleType().getTypeCode()), type);
       }
+
+      // -- refresh the lock-free lookup table used by getBuiltInTypeName(int)
+      rebuildTypeNameTable();
     } catch (Exception except) {
       // Of course, this should not happen if the config files are there.
       String err = Messages.message("schema.cantLoadBuiltInTypes") + "; " + except;
