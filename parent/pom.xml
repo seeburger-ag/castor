@@ -15,6 +15,9 @@
       <groupId>org.sonatype.oss</groupId>
       <artifactId>oss-parent</artifactId>
       <version>9</version>
+      <!-- Empty: oss-parent is resolved from the repository, not from ../pom.xml
+           (which is the castor aggregator, a different artifact). -->
+      <relativePath />
    </parent>
 
    <name>Castor</name>
@@ -73,10 +76,11 @@
             <plugin>
                <groupId>org.apache.maven.plugins</groupId>
                <artifactId>maven-compiler-plugin</artifactId>
-               <version>3.5.1</version>
+               <!-- 3.5.1 predates JDK 9 and has no <release> support: it compiled
+                    against the running JDK's API while only claiming target 11. -->
+               <version>3.13.0</version>
                <configuration>
-                  <source>1.7</source>
-                  <target>1.7</target>
+                  <release>${maven.compiler.release}</release>
                </configuration>
             </plugin>
             <plugin>
@@ -92,7 +96,9 @@
             <plugin>
                <groupId>org.apache.maven.plugins</groupId>
                <artifactId>maven-enforcer-plugin</artifactId>
-               <version>1.4.2-SNAPSHOT</version>
+               <!-- was 1.4.2-SNAPSHOT: the Castor project version had been
+                    copy-pasted onto an Apache plugin; that artifact does not exist. -->
+               <version>3.4.1</version>
             </plugin>
             <plugin>
                <groupId>org.apache.maven.plugins</groupId>
@@ -133,7 +139,7 @@
             <plugin>
                <groupId>org.codehaus.mojo</groupId>
                <artifactId>castor-maven-plugin</artifactId>
-               <version>3.0-SNAPSHOT</version>
+               <version>2.1</version>
             </plugin>
             <plugin>
                <groupId>org.apache.maven.plugins</groupId>
@@ -174,7 +180,10 @@
             <plugin>
                <groupId>org.apache.maven.plugins</groupId>
                <artifactId>maven-plugin-plugin</artifactId>
-               <version>3.4</version>
+               <!-- 3.4 bundles ASM 5 which cannot read Java 11+ bytecode
+                    (IllegalArgumentException in org.objectweb.asm.ClassReader).
+                    Keep in sync with maven-plugin-annotations below. -->
+               <version>${maven-plugin-tools.version}</version>
                <executions>
                   <execution>
                      <id>default-descriptor</id>
@@ -193,6 +202,36 @@
       </pluginManagement>
 
       <plugins>
+         <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <!-- oss-parent:9 declares enforcer 1.2 (2012) directly in <build><plugins>
+                 with a live "enforce-maven" execution. An explicit version there wins
+                 over <pluginManagement>, so it must be overridden here as well.
+                 The inherited rule only guarded against Maven 2.1.0/2.2.0 GPG bugs and
+                 is replaced by the minimum versions this build actually requires. -->
+            <version>3.4.1</version>
+            <executions>
+               <execution>
+                  <id>enforce-maven</id>
+                  <goals>
+                     <goal>enforce</goal>
+                  </goals>
+                  <configuration>
+                     <rules>
+                        <requireMavenVersion>
+                           <version>[3.6.3,)</version>
+                           <message>maven-plugin-plugin 3.13.1 requires Maven 3.6.3 or newer.</message>
+                        </requireMavenVersion>
+                        <requireJavaVersion>
+                           <version>[11,)</version>
+                           <message>This build targets Java 11 bytecode and requires a JDK 11 or newer.</message>
+                        </requireJavaVersion>
+                     </rules>
+                  </configuration>
+               </execution>
+            </executions>
+         </plugin>
          <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-release-plugin</artifactId>
@@ -378,12 +417,31 @@
             <artifactId>spring-beans</artifactId>
             <version>${spring.version}</version>
             <scope>test</scope>
+            <exclusions>
+               <!-- See spring-context below. -->
+               <exclusion>
+                  <groupId>org.springframework</groupId>
+                  <artifactId>spring-jcl</artifactId>
+               </exclusion>
+            </exclusions>
          </dependency>
 
          <dependency>
             <groupId>org.springframework</groupId>
             <artifactId>spring-context</artifactId>
             <version>${spring.version}</version>
+            <exclusions>
+               <!-- As of Spring 5, spring-core pulls in spring-jcl instead of depending on
+                    commons-logging. spring-jcl re-implements the very same
+                    org.apache.commons.logging.* classes, so keeping it would put duplicate
+                    classes on the classpath next to the commons-logging 1.2 that Castor itself
+                    compiles against. Excluding it leaves commons-logging as the single JCL
+                    provider and keeps Castor's logging behaviour unchanged. -->
+               <exclusion>
+                  <groupId>org.springframework</groupId>
+                  <artifactId>spring-jcl</artifactId>
+               </exclusion>
+            </exclusions>
          </dependency>
 
          <dependency>
@@ -391,6 +449,13 @@
             <artifactId>spring-test</artifactId>
             <version>${spring.version}</version>
             <scope>test</scope>
+            <exclusions>
+               <!-- See spring-context above. -->
+               <exclusion>
+                  <groupId>org.springframework</groupId>
+                  <artifactId>spring-jcl</artifactId>
+               </exclusion>
+            </exclusions>
          </dependency>
 
          <dependency>
@@ -495,7 +560,7 @@
          <dependency>
             <groupId>org.apache.maven.plugin-tools</groupId>
             <artifactId>maven-plugin-annotations</artifactId>
-            <version>3.4</version>
+            <version>${maven-plugin-tools.version}</version>
             <scope>provided</scope>
          </dependency>
 
@@ -729,13 +794,25 @@
    </pluginRepositories>
 
    <properties>
-      <spring.version>4.3.0.RELEASE</spring.version>
+      <!-- Spring 4.3.x is a Java 6-8 line: its repackaged CGLIB (org.springframework.cglib)
+           bundles ASM 5, which cannot read Java 9+ class files. On a JDK 11 the @Configuration
+           class enhancement therefore died with
+           "NoClassDefFoundError: Could not initialize class org.springframework.cglib.proxy.Enhancer".
+           5.3.x is the last OSS line with a Java 8 baseline (so it still runs on our Java 11
+           target) and ships ASM 9. Spring 6.x is NOT an option here: it requires Java 17. -->
+      <spring.version>5.3.39</spring.version>
       <surefire.print.summary>false</surefire.print.summary>
+      <!-- maven-plugin-plugin + maven-plugin-annotations must always use the same version -->
+      <maven-plugin-tools.version>3.13.1</maven-plugin-tools.version>
+      <maven.compiler.release>11</maven.compiler.release>
+      <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+      <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
       <VERSION>${project.version}</VERSION>
       <RELEASE />
    </properties>
 
-   <prerequisites>
-      <maven>3.0.3</maven>
-   </prerequisites>
+   <!-- <prerequisites> removed: it is only valid for maven-plugin packaging and is now
+        declared in the castor-maven-plugins module. Inheriting it made Maven warn on
+        every other module. The build-wide minimum Maven/JDK versions are enforced by the
+        requireMavenVersion / requireJavaVersion rules in maven-enforcer-plugin above. -->
 </project>
