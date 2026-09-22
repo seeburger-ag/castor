@@ -115,7 +115,6 @@ public abstract class AbstractTestSuiteMojo extends AbstractMojo {
 
     // set classpath for testcompiler
     // TODO
-    String dirSeparator = System.getProperty("file.separator");
     StringBuilder classpath = new StringBuilder();
     String pathSeparator = System.getProperty("path.separator");
     for (@SuppressWarnings("unchecked")
@@ -131,16 +130,19 @@ public abstract class AbstractTestSuiteMojo extends AbstractMojo {
       getLog().info("Usage of -DpathToTools !");
       classpath.append(pathToTools + pathSeparator + "tools.jar");
     } else {
+      // -- JDK 8 and earlier ship the compiler in <jdk>/lib/tools.jar, and "java.home" points at
+      // -- <jdk>/jre when running from a JDK. JDK 9+ dropped both the nested jre/ directory and
+      // -- tools.jar (the compiler is part of the jdk.compiler module), so the old
+      // -- javaHome.lastIndexOf("/jre") lookup returns -1 there and substring(0, -1) blew up with
+      // -- "begin 0, end -1, length ...". Only add the tools.jar entries when they really exist.
       String javaHome = System.getProperty("java.home");
-      classpath.append(javaHome);
-      classpath.append(dirSeparator);
-      classpath.append("lib");
-      classpath.append(dirSeparator);
-      classpath.append("tools.jar");
-      classpath.append(pathSeparator);
-      classpath.append(javaHome.substring(0, javaHome.lastIndexOf("/jre")) + dirSeparator + "lib"
-          + dirSeparator + "tools.jar");
-      classpath.append(pathSeparator);
+      appendIfExists(classpath, new File(new File(javaHome, "lib"), "tools.jar"), pathSeparator);
+
+      File javaHomeDir = new File(javaHome);
+      if ("jre".equals(javaHomeDir.getName()) && javaHomeDir.getParentFile() != null) {
+        appendIfExists(classpath, new File(new File(javaHomeDir.getParentFile(), "lib"),
+            "tools.jar"), pathSeparator);
+      }
     }
 
     // set system proerties for
@@ -169,5 +171,27 @@ public abstract class AbstractTestSuiteMojo extends AbstractMojo {
    * @throws MojoExecutionException If test execution fails.
    */
   public abstract void runJUnit(Test testSuite) throws MojoExecutionException;
+
+  /**
+   * Appends the given file to the classpath, but only if it actually exists.
+   * <p>
+   * Non-existing entries are harmless for most tools but pointless, and computing them used to be
+   * the source of JDK-version specific breakage (see {@link #execute()}).
+   *
+   * @param classpath the classpath being assembled.
+   * @param entry the candidate classpath entry.
+   * @param pathSeparator the platform path separator appended after the entry.
+   */
+  private void appendIfExists(final StringBuilder classpath, final File entry,
+      final String pathSeparator) {
+    if (!entry.exists()) {
+      if (getLog().isDebugEnabled()) {
+        getLog().debug("Skipping non-existing classpath entry: " + entry.getAbsolutePath());
+      }
+      return;
+    }
+    classpath.append(entry.getAbsolutePath());
+    classpath.append(pathSeparator);
+  }
 
 }
