@@ -43,8 +43,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Vector;
-import java.util.Hashtable;
-import java.util.Enumeration;
+import java.util.concurrent.ConcurrentHashMap;
 
 
 /**
@@ -106,12 +105,13 @@ public class Schema extends Annotated {
    * The global AttribteGroups for this Schema
    **/
   private final Map<String, AttributeGroup> _attributeGroups =
-      new Hashtable<String, AttributeGroup>();
+      new ConcurrentHashMap<String, AttributeGroup>();
 
   /**
    * The global attributes for this Schema
    **/
-  private final Map<String, AttributeDecl> _attributes = new Hashtable<String, AttributeDecl>();
+  private final Map<String, AttributeDecl> _attributes =
+      new ConcurrentHashMap<String, AttributeDecl>();
 
   /**
    * The value of the block attribute.
@@ -122,7 +122,8 @@ public class Schema extends Annotated {
   /**
    * A list of defined architypes
    **/
-  private final Map<String, ComplexType> _complexTypes = new Hashtable<String, ComplexType>();
+  private final Map<String, ComplexType> _complexTypes =
+      new ConcurrentHashMap<String, ComplexType>();
 
   /**
    * The elementFormDefault attribute for this Schema
@@ -132,7 +133,8 @@ public class Schema extends Annotated {
   /**
    * A list of defined elements
    **/
-  private final Map<String, ElementDecl> _elements = new Hashtable<String, ElementDecl>();
+  private final Map<String, ElementDecl> _elements =
+      new ConcurrentHashMap<String, ElementDecl>();
 
   /**
    * The value of the final attribute.
@@ -142,13 +144,13 @@ public class Schema extends Annotated {
   /**
    * A list of defined top-levels groups
    */
-  private final Map<String, ModelGroup> _groups = new Hashtable<String, ModelGroup>();
+  private final Map<String, ModelGroup> _groups = new ConcurrentHashMap<String, ModelGroup>();
 
   /**
-   * A list of defined <redefine>
+   * A list of defined &lt;redefine&gt;
    */
   private final Map<String, RedefineSchema> _redefineSchemas =
-      new Hashtable<String, RedefineSchema>();
+      new ConcurrentHashMap<String, RedefineSchema>();
 
   /**
    * The ID for this Schema
@@ -158,12 +160,13 @@ public class Schema extends Annotated {
   /**
    * A list of imported schemas
    **/
-  private final Map<String, Schema> _importedSchemas = new Hashtable<String, Schema>();
+  private final Map<String, Schema> _importedSchemas = new ConcurrentHashMap<String, Schema>();
 
   /**
    * A list of included schemas meant to be used only when the cache mechanism is enabled.
    **/
-  private final Map<String, Schema> _cachedincludedSchemas = new Hashtable<String, Schema>();
+  private final Map<String, Schema> _cachedincludedSchemas =
+      new ConcurrentHashMap<String, Schema>();
 
 
   /**
@@ -191,7 +194,7 @@ public class Schema extends Annotated {
   /**
    * A list of defined SimpleTypes
    **/
-  private final Hashtable<String, SimpleType> _simpleTypes = new Hashtable<String, SimpleType>();
+  private final Map<String, SimpleType> _simpleTypes = new ConcurrentHashMap<String, SimpleType>();
 
   /**
    * The targetNamespace for this Schema
@@ -1288,10 +1291,12 @@ public class Schema extends Annotated {
    **/
   public Collection<SimpleType> getSimpleTypes() {
 
-    // -- clean up "deferred types" if necessary
-    Enumeration<SimpleType> enumeration = _simpleTypes.elements();
-    while (enumeration.hasMoreElements()) {
-      SimpleType type = enumeration.nextElement();
+    // -- Clean up "deferred types" if necessary.
+    // -- This deliberately iterates a snapshot-free view while re-putting resolved types under
+    // -- the very same key. That is safe here: ConcurrentHashMap iteration is weakly consistent,
+    // -- and replacing the value of an existing key is not a structural modification anyway.
+    for (SimpleType current : _simpleTypes.values()) {
+      SimpleType type = current;
       if (type != type.getType()) {
         // -- resolve deferred type if necessary
         if (type.getType() != null) {
@@ -1422,7 +1427,7 @@ public class Schema extends Annotated {
     }
 
     return result;
-  } // --getModelGroup
+  } // -- getModelGroup
 
   /**
    * Returns an Enumeration of all top-level ModelGroup declarations

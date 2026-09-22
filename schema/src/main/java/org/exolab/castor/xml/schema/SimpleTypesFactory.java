@@ -38,9 +38,10 @@ package org.exolab.castor.xml.schema;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.io.PrintWriter;
-import java.util.Hashtable;
 import java.util.Map;
 import java.util.Vector;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -139,13 +140,59 @@ public class SimpleTypesFactory {
   /**
    * Holds simpletypesfactory.Type instances that record information about XML schema built in
    * types.
+   * <p>
+   * A {@link ConcurrentHashMap} rather than the historical {@link java.util.Hashtable}: reads are
+   * lock-free, which matters because {@link #getBuiltInType(String)} is on the hot path of every
+   * schema parse. Null keys and values are rejected by both implementations alike, so the
+   * behaviour of this map is unchanged.
    */
-  private static Map<String, Type> _typesByName = new Hashtable<String, Type>();
+  private static final ConcurrentMap<String, Type> _typesByName =
+      new ConcurrentHashMap<String, Type>();
 
   /**
    * Cross index for _typesByName to quickly get type information from its code.
+   * <p>
+   * See {@link #_typesByName} for why this is a {@link ConcurrentHashMap}. Historically this map
+   * was the single most contended monitor in the whole schema package, because
+   * {@link #getBuiltInTypeName(int)} resolved every call through it; that lookup is now served by
+   * the lock-free {@link #_typeNamesByCode} table instead.
    */
-  private static Map<Integer, Type> _typesByCode = new Hashtable<Integer, Type>();
+  private static final ConcurrentMap<Integer, Type> _typesByCode =
+      new ConcurrentHashMap<Integer, Type>();
+
+  /**
+   * Lock-free lookup table for {@link #getBuiltInTypeName(int)}: built-in type code -&gt; type name.
+   * <p>
+   * The set of built-in types is fixed after {@link #loadTypesDefinitions()} has run, and the type
+   * codes form a small, bounded integer range (see {@link #INVALID_TYPE} ..
+   * {@link #ANYSIMPLETYPE_TYPE}). Resolving a name through {@link #_typesByCode} therefore means
+   * paying for {@link Integer} boxing plus a hash lookup - and, before this map became a
+   * {@link ConcurrentHashMap}, a <em>synchronized</em> {@link java.util.Hashtable#get(Object)} on a
+   * single, process-wide monitor. That was a severe scalability bottleneck for callers resolving
+   * type names in tight loops (for example bean introspection frameworks that treat
+   * {@code getBuiltInTypeName(int)} as a JavaBeans indexed getter).
+   * <p>
+   * The table is rebuilt by {@link #rebuildTypeNameTable()} from within {@link #ensureTypesLoaded()}
+   * and published through a single volatile write, so readers can access it without any locking at
+   * all.
+   */
+  private static volatile String[] _typeNamesByCode = new String[0];
+
+  /**
+   * Guards the one-time execution of {@link #loadTypesDefinitions()}.
+   * <p>
+   * A dedicated static lock is required: {@link #loadTypesDefinitions()} mutates <em>static</em>
+   * state, so synchronizing on an <em>instance</em> (as this class used to do) serialises nothing
+   * at all when two threads construct two different factories.
+   */
+  private static final Object INIT_LOCK = new Object();
+
+  /**
+   * Set once {@link #loadTypesDefinitions()} has completed successfully. Volatile so that the
+   * double-checked fast path in {@link #ensureTypesLoaded()} is correct, and so that readers see
+   * the fully populated maps and lookup table that were written before it was set.
+   */
+  private static volatile boolean _typesLoaded;
 
   /** The built-in schema, hopefully only temporary. */
   private static final Schema BUILD_IN_SCHEMA = new Schema();
@@ -153,9 +200,35 @@ public class SimpleTypesFactory {
   /**
    * Creates an instance of {@link SimpleTypesFactory}, loading type definition information from the
    * relevant files.
+   * <p>
+   * The type definitions are shared by all instances and are loaded at most once per classloader;
+   * constructing further factories is therefore cheap and leaves the already published definitions
+   * untouched.
    */
   public SimpleTypesFactory() {
-    loadTypesDefinitions();
+    ensureTypesLoaded();
+  }
+
+  /**
+   * Loads the built-in type definitions unless that has already happened.
+   * <p>
+   * Uses double-checked locking on {@link #INIT_LOCK}: the common case (definitions already
+   * loaded) costs a single volatile read, while the first caller performs the actual work with all
+   * other callers waiting. If loading fails, {@link #_typesLoaded} stays {@code false} so that a
+   * later attempt can retry - which preserves the previous behaviour of retrying on every
+   * construction.
+   */
+  private void ensureTypesLoaded() {
+    if (_typesLoaded) {
+      return;
+    }
+    synchronized (INIT_LOCK) {
+      if (_typesLoaded) {
+        return;
+      }
+      loadTypesDefinitions();
+      _typesLoaded = true;
+    }
   }
 
   /**
@@ -217,13 +290,21 @@ public class SimpleTypesFactory {
 
   /**
    * Gets a built in type's name given its code.
+   * <p>
+   * This is a lock-free, allocation-free O(1) lookup backed by {@link #_typeNamesByCode}. It is
+   * behaviourally identical to a lookup in {@link #_typesByCode}: unknown or out-of-range codes
+   * (including {@link #INVALID_TYPE} and {@link #USER_TYPE}) yield {@code null}, known codes yield
+   * the very same {@link String} instance that {@code Type#getName()} would return.
+   *
+   * @param builtInTypeCode the built-in type code to resolve.
+   * @return the name of the built-in type, or {@code null} if the code is not a built-in type.
    */
   public String getBuiltInTypeName(final int builtInTypeCode) {
-    Type type = getType(builtInTypeCode);
-    if (type == null) {
+    final String[] names = _typeNamesByCode;
+    if (builtInTypeCode < 0 || builtInTypeCode >= names.length) {
       return null;
     }
-    return type.getName();
+    return names[builtInTypeCode];
   }
 
 
@@ -365,18 +446,57 @@ public class SimpleTypesFactory {
   }
 
   /**
-   * Gets the informations about the built in type which code is provided as input parameter. Loads
-   * the types definitions if they were not yet loaded
+   * Gets the informations about the built in type which code is provided as input parameter.
+   * <p>
+   * <b>Note:</b> this is the original, map-backed lookup. It is no longer used by
+   * {@link #getBuiltInTypeName(int)}, which is served from the lock-free {@link #_typeNamesByCode}
+   * table instead. It is kept package private so that tests can verify that both lookups stay
+   * equivalent, and for any caller that needs the full {@link Type} rather than just its name.
+   *
+   * @param typeCode the built-in type code to resolve.
+   * @return the {@link Type} for the given code, or {@code null} if the code is unknown.
    */
-  private Type getType(final int typeCode) {
+  Type getType(final int typeCode) {
     return _typesByCode.get(Integer.valueOf(typeCode));
+  }
+
+  /**
+   * (Re)builds the lock-free {@link #_typeNamesByCode} lookup table from {@link #_typesByCode}.
+   * <p>
+   * Must only be called while holding {@link #INIT_LOCK}. The freshly built array is never mutated
+   * afterwards and is handed over to readers through a single volatile write, which guarantees safe
+   * publication of its contents.
+   */
+  private static void rebuildTypeNameTable() {
+    int maxCode = 0;
+    for (Integer code : _typesByCode.keySet()) {
+      if (code.intValue() > maxCode) {
+        maxCode = code.intValue();
+      }
+    }
+
+    final String[] names = new String[maxCode + 1];
+    for (Map.Entry<Integer, Type> entry : _typesByCode.entrySet()) {
+      final int code = entry.getKey().intValue();
+      if (code >= 0) {
+        names[code] = entry.getValue().getName();
+      }
+    }
+
+    // -- single volatile write: safely publishes the fully initialised array.
+    _typeNamesByCode = names;
   }
 
   /**
    * Loads the built in type definitions from their xml file and its mapping file into the static
    * fields typesByName and typeByCode. Loading is done only once.
+   * <p>
+   * Must only be called from {@link #ensureTypesLoaded()}, which holds {@link #INIT_LOCK} and
+   * guarantees that this runs exactly once per classloader. Re-running it would replace the shared
+   * {@link Type} and {@link SimpleType} instances while schemas already reference the previous
+   * ones.
    */
-  private synchronized void loadTypesDefinitions() {
+  private void loadTypesDefinitions() {
     InputStream is = null;
 
     try { // Load the mapping file
@@ -405,6 +525,9 @@ public class SimpleTypesFactory {
         type.setSimpleType(createSimpleType(BUILD_IN_SCHEMA, type));
         _typesByCode.put(Integer.valueOf(type.getSimpleType().getTypeCode()), type);
       }
+
+      // -- refresh the lock-free lookup table used by getBuiltInTypeName(int)
+      rebuildTypeNameTable();
     } catch (Exception except) {
       // Of course, this should not happen if the config files are there.
       String err = Messages.message("schema.cantLoadBuiltInTypes") + "; " + except;
