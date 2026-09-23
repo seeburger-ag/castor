@@ -380,14 +380,28 @@
    </mailingLists>
 
    <scm>
-      <connection>scm:git:https://github.com/castor-data-binding/castor.git/tags/castor-1.4.0/castor.git</connection>
+      <connection>scm:git:https://github.com/seeburger-ag/castor.git</connection>
+      <developerConnection>scm:git:git@github.com:seeburger-ag/castor.git</developerConnection>
+      <url>https://github.com/seeburger-ag/castor</url>
    </scm>
 
 
    <distributionManagement>
+      <repository>
+         <id>release</id>
+         <name>SEEBURGER Release Repository</name>
+         <url>https://repo.seeburger.de/archiva/repository/release/</url>
+      </repository>
+
+      <snapshotRepository>
+         <id>snapshot</id>
+         <name>SEEBURGER Snapshot Repository</name>
+         <url>https://repo.seeburger.de/archiva/repository/snapshot/</url>
+      </snapshotRepository>
+
       <site>
          <id>github</id>
-         <url>scm:git:git@github.com:castor-data-binding/castor.git</url>
+         <url>scm:git:git@github.com:seeburger-ag/castor.git</url>
       </site>
 
    </distributionManagement>
@@ -761,6 +775,13 @@
                   <groupId>org.apache.maven.plugins</groupId>
                   <artifactId>maven-gpg-plugin</artifactId>
                   <version>1.6</version>
+                  <!-- Artifacts are deployed to the internal SEEBURGER repositories,
+                       which do not require PGP signatures. Signing is therefore
+                       disabled (also covers the gpg execution inherited from
+                       oss-parent via the gpg.skip property below). -->
+                  <configuration>
+                     <skip>true</skip>
+                  </configuration>
                   <executions>
                      <execution>
                         <id>sign-artifacts</id>
@@ -768,6 +789,9 @@
                         <goals>
                            <goal>sign</goal>
                         </goals>
+                        <configuration>
+                           <skip>true</skip>
+                        </configuration>
                      </execution>
                   </executions>
                </plugin>
@@ -809,6 +833,10 @@
       <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
       <VERSION>${project.version}</VERSION>
       <RELEASE />
+      <!-- Never sign artifacts: the internal SEEBURGER repositories do not require
+           PGP signatures. This also disables the gpg execution inherited from
+           oss-parent's own release profile. -->
+      <gpg.skip>true</gpg.skip>
    </properties>
 
    <!-- <prerequisites> removed: it is only valid for maven-plugin packaging and is now

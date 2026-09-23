@@ -17,6 +17,12 @@
     Java objects, XML documents and relational tables.
    </description>
 
+    <scm>
+        <connection>scm:git:https://github.com/seeburger-ag/castor.git</connection>
+        <developerConnection>scm:git:git@github.com:seeburger-ag/castor.git</developerConnection>
+        <url>https://github.com/seeburger-ag/castor</url>
+    </scm>
+
    <modules>
       <module>parent</module>
       <module>core</module>
