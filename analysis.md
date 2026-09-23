@@ -1,8 +1,10 @@
 # Thread Dump Analysis - JXPath / Castor Blocking (`dump2.txt`)
 
-_Analysis date: 2026-09-22, updated 2026-09-23. JVM: Java 21.0.12. Container: Apache Karaf / Felix._
+_Analysis date: 2026-09-22. Last updated: 2026-09-23. JVM of the dump: Java 21.0.12. Container:
+Apache Karaf / Felix._
 
-_Sources inspected: `commons-jxpath` (SEEBURGER fork) and `castor` (this repository)._
+_Sources inspected: `commons-jxpath` (SEEBURGER fork, branch `1.4-seeburger`) and `castor`
+(this repository)._
 
 _Thread dump analysed: `dump2.txt` (kept in the `commons-jxpath` working copy)._
 
@@ -10,15 +12,22 @@ _Thread dump analysed: `dump2.txt` (kept in the `commons-jxpath` working copy)._
 
 | Fix | Repository | Commit | State |
 |---|---|---|---|
-| **F1** - lock-free `getBuiltInTypeName` | `castor` | `8fa4a3f3a` | **Committed and verified** (see 5a) |
+| **F1** - lock-free `getBuiltInTypeName` | `castor` | `4dcbd52ca` | **Committed and verified** (see 5a) |
 | **F3a** - hide the property from JXPath | `commons-jxpath` (branch `1.4-seeburger`) | `5ed7f7f4` | **Committed and verified** (see 5b) |
-| **F2** - `ConcurrentHashMap` + single init | `castor` | working tree | **Implemented and verified** (see 5c) |
-| F2c - de-`Hashtable` the `Schema` fields | `castor` | - | Deferred, see 5c |
-| F4 - JXPath probe hardening | `commons-jxpath` | - | Open |
+| **F2** - `ConcurrentHashMap` + single init | `castor` | `9d614be89` | **Committed and verified** (see 5c) |
+| **F2c** - de-`Hashtable` the `Schema` fields | `castor` | `8d6ba2df0` | **Committed and verified** (see 5d) |
+| **F4-1** - allocation-free indexed probe | `commons-jxpath` (branch `1.4-seeburger`) | `0164c1e1` | **Committed and verified** (see 5e) |
+| F4-2 / F4-3 - configurable cap, opt-in early exit | `commons-jxpath` | - | Open, **re-scoped 2026-09-23** (see F4) |
+| F4-4 / F4-5 - class-scoped memoization, debug logging | - | - | **Rejected 2026-09-23** (see F4) |
 | F5 - expression / model redesign | Engine | - | Open |
 
-Both working trees are clean apart from the F2 change; the only untracked files are `dump2.txt` in
-`commons-jxpath` and the new F2 test in `castor`.
+Both repositories are clean apart from this document; the only untracked file is `dump2.txt` in
+`commons-jxpath`.
+
+**Build status.** `castor` builds and its full suite passes: **454 tests, 0 failures, 0 errors,
+BUILD SUCCESS** across all 13 modules (Maven 3.9.16, JDK 11). `commons-jxpath` passes
+**398 tests, 0 failures, 0 errors, BUILD SUCCESS on JDK 8**; on JDK 11 that module has 127
+pre-existing, unrelated errors (see the note at the end of section 5e).
 
 ## 1. Summary
 
@@ -246,7 +255,8 @@ and `NodePointer.handle(Throwable)` (lines 818-835) **discards** the throwable w
 - **nothing is logged**, there is no `"Cannot determine the length of the indexed property"`
   message anywhere;
 - the only symptom is burnt CPU and, in production, the monitor the getter happens to acquire;
-- the `0` length is never cached, so the probe runs **again** on the next scan.
+- the `0` length is never cached, so the probe runs **again** on the next scan. Note this is a
+  *per-traversal* repeat, not something a global cache can fix; see F4-4.
 
 Measured in `JXPathFilteredBeanInfoTest` with a single bean carrying one such property, one
 `//*` evaluation invoked the indexed getter **96000 times = 6 full probes**.
@@ -286,7 +296,7 @@ shipped on its own.
 
 ### F1 - Cache `getBuiltInTypeName` in Castor (primary target: highest value, lowest risk)
 
-> **Status: IMPLEMENTED, VERIFIED, COMMITTED** as `8fa4a3f3a`.
+> **Status: IMPLEMENTED, VERIFIED, COMMITTED** as `4dcbd52ca`.
 > Code: `castor/schema/src/main/java/org/exolab/castor/xml/schema/SimpleTypesFactory.java`
 > Test: `castor/schema/src/test/java/org/exolab/castor/xml/schema/SimpleTypesFactoryLockFreeLookupTest.java`
 > See section 5a for the measured result.
@@ -352,7 +362,7 @@ Still lock-free, but slower and more code than the array. Not recommended; the a
 
 ### F2 - De-`Hashtable` and single-init Castor (structural hygiene)
 
-> **Status: IMPLEMENTED AND VERIFIED** (working tree).
+> **Status: IMPLEMENTED, VERIFIED, COMMITTED** as `9d614be89`.
 > Code: `castor/schema/src/main/java/org/exolab/castor/xml/schema/SimpleTypesFactory.java`
 > Test: `castor/schema/src/test/java/org/exolab/castor/xml/schema/SimpleTypesFactoryInitialisationTest.java`
 > See section 5c for the measured result.
@@ -387,8 +397,8 @@ private void ensureTypesLoaded() {
    A static holder class would also do the job and let the JVM class-initialization lock handle
    it, but it moves the load to a different point in time, which the initialization-order trap
    below makes risky. Double-checked locking keeps the timing exactly as it was.
-3. Same treatment for the per-instance `Hashtable` fields of `Schema` (lines 108-114). See 5c for
-   why this part is deferred.
+3. Same treatment for the per-instance `Hashtable` fields of `Schema` (lines 108-194). Carried out
+   as F2c; see section 5d.
 
 **Risk:** low. Keep `Map` as the declared type so no call site changes. Note that
 `ConcurrentHashMap` rejects `null` keys and values - but so does `Hashtable`, so this is not a
@@ -446,28 +456,194 @@ public String[] getBuiltInTypeName() {          // makes pd.getReadMethod() != n
 }
 ```
 
-`ValueUtils.getIndexedPropertyLength` then takes the fast branch at lines 110-112 and returns
+`ValueUtils.getIndexedPropertyLength` then takes the fast branch at lines 115-117 and returns
 about 101 immediately. **Caveat:** the array becomes visible to JXPath as child nodes, which
 *changes XPath results*. Not recommended now that F3a exists.
 
 ### F4 - Harden `commons-jxpath` (benefits every consumer)
 
-In `ValueUtils.getIndexedPropertyLength`:
+> **Re-evaluated on 2026-09-23 against the current fork.** Two of the five original items turned
+> out to be unsound or inappropriate and have been dropped; the rest are re-ordered by risk. The
+> priority of F4 as a whole has also dropped, because F3a already neutralises the concrete incident
+> and F1/F2 make the Castor getter cheap and lock-free even when it *is* probed: a full 16000-call
+> probe now costs 16000 array reads with zero contention instead of 16000 locked `Hashtable` gets.
+> F4 is therefore defence-in-depth against the *next* getter of this shape, not an incident fix.
 
-1. **Memoize the outcome** per `Class` plus property name in a `ConcurrentHashMap`, so the
-   16000-iteration probe happens at most **once per class and property per JVM**, not once per
-   scan. This is especially valuable because `PropertyIterator.getLength()` swallows the failure
-   and never caches the `0`; see section 4.2b.
-2. **Treat a run of `null` returns as end-of-collection**, for example stop after 32 consecutive
-   `null`s. This restores O(size) behaviour for getters that return `null` instead of throwing, a
-   very common real-world pattern.
-3. **Make `UNKNOWN_LENGTH_MAX_COUNT` configurable** via a system property, defaulting far below
-   16000.
-4. Replace `new Integer(i)` (line 122) with `Integer.valueOf(i)` to hit the `IntegerCache`.
-5. Consider *logging* at debug level when a probe runs to exhaustion; today the condition is
-   completely invisible.
+Current code under review: `ValueUtils.getIndexedPropertyLength` (lines 108-132), its only real
+caller `BeanPropertyPointer.getLength()` (lines 195-212), and `PropertyIterator.getLength()`
+(lines 311-325). The fork compiles at **source/target 1.8**, so generics and
+`java.util.concurrent` are available.
 
-### F5 - Application and expression level
+> Line numbers in this section are those of the file **as reviewed, before F4-1**. F4-1 has since
+> been applied, so the method now begins at line 113 and its fast path is at lines 115-117.
+
+#### F4-1. Replace `new Integer(i)` with `Integer.valueOf(i)` - do this first
+
+> **Status: IMPLEMENTED, VERIFIED, COMMITTED** as `0164c1e1` on branch `1.4-seeburger`.
+> Code: `commons-jxpath/src/main/java/org/apache/commons/jxpath/util/ValueUtils.java`
+> Test: `commons-jxpath/src/test/java/org/apache/commons/jxpath/util/ValueUtilsIndexedPropertyLengthTest.java`
+> See section 5e for the measured result.
+
+Line 122. Removes up to 16000 allocations per probe, hits the `IntegerCache` for the first 128
+indices, and clears a deprecation warning (`new Integer(int)` is deprecated since Java 9).
+
+**Risk: none.** Behaviour is bit-for-bit identical. Unconditional.
+
+#### F4-2. Make the cap configurable - safe, and idiomatic here
+
+```java
+private static final int UNKNOWN_LENGTH_MAX_COUNT =
+        Integer.getInteger("jxpath.unknownLengthMaxCount", 16000).intValue();
+```
+
+This matches an existing convention that the original plan did not account for: the library
+already reads `jxpath.cache.enabled`, `jxpath.cache.statistics` and `jxpath.cache.soft` in
+`JXPathContextReferenceImpl` (lines 102-104) and `jxpath.debug` in `JXPathContextFactory`
+(line 151), so a `jxpath.*` system property is the house style.
+
+**Correction to the original wording.** It proposed "defaulting far below 16000". That would
+silently truncate any indexed property with more elements than the new default and no array
+getter, which changes XPath results. The default must stay **16000**; the property is an
+operational lever, not a behaviour change.
+
+**Risk: none at the default.**
+
+#### F4-3. Early termination on a run of `null` returns - opt-in only
+
+```java
+// jxpath.indexedProbeNullLimit, default 0 = disabled
+```
+
+When set to N > 0, stop after N consecutive `null` returns and report the index at which that run
+started.
+
+Two findings from the current code change how this should be framed:
+
+- **It cannot fire for primitive-valued getters.** `TestIndexedPropertyBean.getIndexed(int)`
+  returns a primitive `int`, which boxes to a non-null `Integer`. The heuristic therefore only
+  ever helps *reference*-returning getters, which is exactly the Castor shape, but it means the
+  feature is narrower than the original text implied.
+- **For the pathological case the observable result is unchanged.** A getter that returns `null`
+  at every index yields "length 0" today as well: the probe exhausts, throws `JXPathException`,
+  and `PropertyIterator.getLength()` swallows it and substitutes 0 (section 4.2b). The heuristic
+  reaches the same 0 about 500 times faster. The difference is only visible to a caller that
+  invokes `ValueUtils.getIndexedPropertyLength` directly and catches the exception.
+
+**Risk: real but narrow.** A sparse, reference-valued indexed property with no array getter and
+at least N consecutive `null` holes would be truncated. That is why this must default to disabled
+rather than to some "sensible" N.
+
+#### F4-4. REJECTED: memoizing the probe result per class and property
+
+The original item 1 proposed caching the outcome in a `ConcurrentHashMap` keyed on `Class` plus
+property name. **This is unsound and must not be implemented.**
+
+The length of an indexed property is a function of the *instance's state*, not of its class. The
+fork's own test bean proves it: `TestBean.setIntegers(int, int)` calls
+`ValueUtils.expandCollection` and grows the backing array, so the length of that property changes
+at runtime. A class-scoped cache would hand stale lengths to every other instance and to the same
+instance after any mutation, producing wrong XPath results.
+
+The weaker variant - caching only the boolean verdict *"this getter never throws, so probing is
+futile"* - is **also** unsound. Consider the common shape
+
+```java
+public Foo getFoo(int i) { return arr == null ? null : arr[i]; }
+```
+
+which exhausts the probe when `arr` is `null` but terminates correctly when it is not. Caching the
+verdict from the first instance would make every later instance throw `JXPathException`, and thus
+report length 0, instead of its true length.
+
+**Safe replacement, if the repeat cost is worth attacking:** memoize *within a single traversal*,
+not globally. The measured 96000 invocations in `JXPathFilteredBeanInfoTest` are 6 full probes for
+one `//*` evaluation over one bean, so the repeat factor - not the 16000 cap - is the cheaper half
+of the problem. `PropertyIterator.getLength()` already carries the comment
+`// TBD: cache length` at line 318, which is the right place: one `PropertyIterator` walks one
+bean, and an XPath evaluation does not mutate it. **Risk: medium**, because a custom extension
+function invoked mid-expression could in principle mutate the bean.
+
+#### F4-5. REJECTED: debug logging when a probe exhausts
+
+`src/main` contains **zero** references to `org.apache.commons.logging`: this library deliberately
+does not log. Adding a log call, in a hot path no less, would break that property and introduce a
+runtime dependency the fork does not currently have.
+
+The condition is already reachable through supported means, and section 7 item 4 documents it:
+install a `JXPathContext.setExceptionHandler(...)` and the swallowed `JXPathException` becomes
+visible. No library change is needed.
+
+#### F4 - the canonical fix, for reference
+
+`TestBean` shows the shape that avoids the whole problem: `getIntegers(int)` has a companion
+`int[] getIntegers()`, so `pd.getReadMethod() != null` and
+`getIndexedPropertyLength` takes the O(1) fast path at lines 115-117 without ever probing. That is
+the JavaBeans-correct answer and the same idea as F3c; it is a fix for bean authors rather than
+for JXPath.
+
+## 5e. F4-1 - implementation result
+
+### What was changed
+
+`ValueUtils.java`, all three boxing sites on the reflective indexed-property path:
+
+- **the probe itself** (line 122): `new Integer(i)` became `Integer.valueOf(i)`, and the
+  `new Object[] { ... }` argument array was **hoisted out of the loop** and is now mutated per
+  iteration. This turned out to matter far more than the boxing: `Integer.valueOf` only avoids an
+  allocation for the cached range -128..127, so in a 16000-iteration probe it saves 128
+  allocations, whereas hoisting the array saves 16000;
+- `getValue(bean, pd, index)` (line 446) and `setValue(bean, pd, index, value)` (line 490), which
+  are on the same reflective path and were changed for consistency.
+
+Reusing the argument array is safe: the reflection machinery unpacks it before the getter is
+entered, so the callee never obtains a reference to it.
+
+The four remaining `new Integer(...)` sites in `src/main` (`BasicTypeConverter` x3,
+`CoreFunction` x1) are not on this path and were deliberately left alone; four further matches are
+prose inside javadoc.
+
+### The test
+
+There was **no direct test of `getIndexedPropertyLength` at all**, which is a notable gap for the
+method at the centre of this incident. `ValueUtilsIndexedPropertyLengthTest` (JUnit 3, matching
+the project style) closes it:
+
+| Test | Purpose |
+|---|---|
+| `testArrayGetterUsesFastPathWithoutProbing` | With a companion array getter the fast path is taken and the indexed getter is invoked **0** times. |
+| `testThrowingIndexedGetterTerminatesAtBound` | A well behaved getter that throws terminates the probe at the correct length. |
+| `testProbePassesEveryIndexInOrder` | **Guards the array reuse**: the getter must see every index exactly once, ascending from 0. A stale or repeated index would show up here. |
+| `testGetterReturningNullRunsToExhaustionAndThrows` | The pathological shape throws `JXPathException` after exactly 16000 calls. This pins the cap that F4-2 will make configurable. |
+| `testProbeAllocationIsBounded` | Measures and reports allocation per probe. |
+
+All five tests pass against the **pre-F4-1** code as well, which is the point: F4-1 is a pure
+refactor, and the new tests are a characterisation of existing behaviour that will protect F4-2
+and F4-3.
+
+### Measured (JDK 8, one exhausting 16000-iteration probe)
+
+```
+                              before F4-1        after F4-1
+  allocated ............   641 464 bytes     255 912 bytes
+  per iteration ........        40 bytes          15 bytes
+```
+
+About **2,5x less garbage per probe**, 385 552 bytes saved. The remaining 15 bytes per iteration
+are the `Integer` for indices at or above 128, which cannot be avoided without changing the
+reflective call itself.
+
+### Note on running the suite
+
+With F4-1 applied: **398 tests (393 existing plus 5 new), 0 failures, 0 errors, BUILD SUCCESS**
+on JDK 8.
+
+On **JDK 11 the suite is broken for unrelated reasons**: 127 errors, all
+`NoClassDefFoundError: org/w3c/dom/ls/DocumentLS`, caused by the old `xml-apis` dependency
+clashing with the JDK's built-in DOM. This was verified to be pre-existing by stashing the change
+and re-running: the baseline reports the identical `393 tests, 0 failures, 127 errors`. Use JDK 8
+for this module until that dependency is addressed.
+
+## 6. Recommended rollout
 
 | Action | Why |
 |---|---|
@@ -522,12 +698,17 @@ OK (5 tests)
 
 **140109 monitor blocks became 0**, and the lookup is about 385 times faster.
 
-> **Note on the surrounding build:** `mvn -pl schema -am` currently fails in this workspace
-> because `org.codehaus.mojo:castor-maven-plugin:3.0-SNAPSHOT` cannot be resolved from the
-> configured repositories. This is pre-existing and unrelated to this change. The test was
-> therefore compiled and executed directly against the locally available
-> `castor-xml-schema` / `castor-xml` / `castor-core` 1.4.1 jars, with the patched
-> `SimpleTypesFactory` shadowing the released class.
+Re-measured through the real Maven build (JDK 11), a representative run reports
+`before (Hashtable) 159,128 ms, blocked 98895 times` versus
+`after (lock-free array) 0,812 ms, blocked 0 times`. The absolute timings move from run to run;
+the **0 blocked** result does not, because the F1 path contains no `synchronized` region.
+
+> **Note on the surrounding build.** At the time F1 was written, `mvn -pl schema -am` could not
+> resolve `org.codehaus.mojo:castor-maven-plugin:3.0-SNAPSHOT`, so this test was compiled and run
+> manually against the locally available `castor-xml-schema` / `castor-xml` / `castor-core` 1.4.1
+> jars with the patched `SimpleTypesFactory` shadowing the released class. **That limitation is
+> gone**: the whole reactor now builds and the full suite (454 tests) runs green under Maven
+> 3.9.16 / JDK 11, and the numbers above were re-measured through the real build.
 
 ## 5b. F3a - implementation result
 
@@ -689,30 +870,99 @@ measurement and silently invalidated the comparison. The test now keeps its own 
 replica of the pre-F1 storage, so it remains an honest record of what F1 improved and is immune to
 further changes to the live field.
 
-### F2c - deferred: the `Schema` fields
+### F2c - the `Schema` fields
 
-Item 3 of F2 (converting the nine per-instance `Hashtable` fields of `Schema`, lines 108-194) has
-**not** been carried out. Rationale:
+> **Status: IMPLEMENTED, VERIFIED, COMMITTED** as `8d6ba2df0`. Originally deferred because the
+> Maven build of this workspace did not run; that blocker is gone, so it has now been carried out.
+> Code: `castor/schema/src/main/java/org/exolab/castor/xml/schema/Schema.java`
+> Test: `castor/schema/src/test/java/org/exolab/castor/xml/schema/SchemaConcurrentMapTest.java`
+> See section 5d for the measured result.
 
-- those monitors are *per `Schema` instance*, not process-wide, so they were never the bottleneck
-  in `dump2.txt`;
-- `Schema` is a 2198-line class with many call sites, and one field (`_simpleTypes`) is declared
-  with the concrete `Hashtable` type and used through the legacy `elements()` API;
-- the change cannot be validated here, because the Maven build of this workspace does not run (see
-  the note in 5a). Making an unverifiable change to a large class carries more risk than the
-  contention it would remove.
+All nine per-instance lookup tables of `Schema` are now `ConcurrentHashMap`s:
+`_attributeGroups`, `_attributes`, `_complexTypes`, `_elements`, `_groups`, `_redefineSchemas`,
+`_importedSchemas`, `_cachedincludedSchemas` and `_simpleTypes`.
 
-It should be done together with a working build and the full schema test suite.
+## 5d. F2c - implementation result
+
+### What was changed
+
+`Schema.java`:
+
+- the nine `Hashtable` fields became `ConcurrentHashMap` (lines 108-197). Eight were already
+  declared as `Map`; `_simpleTypes` was declared with the concrete `Hashtable` type and is now a
+  `Map` as well;
+- `getSimpleTypes()` no longer uses the legacy `Hashtable.elements()` enumeration. It iterates
+  `values()` instead, so the `java.util.Hashtable` and `java.util.Enumeration` imports are gone.
+
+**Null handling is unchanged.** `Hashtable` rejects `null` keys and values exactly like
+`ConcurrentHashMap`, and every accessor already guards its argument and throws
+`IllegalArgumentException` before a `null` can reach the map.
+
+**One subtlety worth recording.** `getSimpleTypes()` *mutates the map while walking it*: it
+replaces deferred types under their own key. That was safe with `Hashtable.elements()`, whose
+`Enumeration` is deliberately **not** fail-fast, and it stays safe with `ConcurrentHashMap`, whose
+iteration is weakly consistent. Replacing the value of an existing key is not a structural
+modification either way.
+
+### The test
+
+`SchemaConcurrentMapTest` (JUnit 4, package `org.exolab.castor.xml.schema`) builds a schema with
+20 declarations of each kind:
+
+| Test | Purpose |
+|---|---|
+| `declarationsStillResolve` | Every declaration resolves; unknown names yield `null`. |
+| `collectionAccessorsAreComplete` | The six collection accessors report every declaration exactly once. |
+| `getSimpleTypesIsStableWhenItRewritesTheTable` | The mutate-while-iterating path does not throw and is repeatable. |
+| `removalStillWorks` | `removeElement` / `removeComplexType` / `removeSimpleType` still work through the converted maps. |
+| `nullNamesAreStillRejected` | The `IllegalArgumentException` contract for `null` names is unchanged. |
+| `concurrentResolutionIsLockFree` | 20 threads x 2 400 000 lookups must block on a monitor exactly **0** times. |
+
+### Measured (20 workers, 2 400 000 lookups, JDK 11)
+
+```
+                                    before F2c        after F2c
+  elapsed ....................     399,556 ms      312,788 ms
+  blocked on monitor .........           3 229              0
+```
+
+Running the same test class against the pre-F2c `Schema` (extracted from git and placed ahead of
+the patched class on the classpath) fails exactly one test, and it is the contention assertion:
+
+```
+1) concurrentResolutionIsLockFree
+   the ConcurrentHashMap-backed lookups must never block on a monitor expected:<0> but was:<3229>
+Tests run: 6,  Failures: 1
+```
+
+The five behavioural tests pass **both** before and after, which is the desired result: F2c removes
+contention without changing semantics.
+
+### A test-harness bug this exposed
+
+The first version of the concurrency harness used two `CyclicBarrier`s. A worker that dies before
+reaching the second barrier leaves the main thread waiting forever, so the very first run **hung**
+instead of failing. The harness now uses a start `CountDownLatch` plus `Thread.join(timeout)` and
+rethrows the first worker throwable, so a broken assumption surfaces as a failing test.
+
+The assumption that broke is itself worth noting: `new Schema()` binds the **XML Schema** namespace
+to the default prefix, so the single-argument `Schema.getSimpleType("simpleType0")` resolves an
+unprefixed name against that namespace and **throws** `IllegalArgumentException` for a user-defined
+type. User types must be looked up with `getSimpleType(name, targetNamespace)`, which is what
+`addSimpleType` does internally. The test now does the same.
 
 ## 6. Recommended rollout
 
 | Step | Change | Scope | Risk | Status | Expected effect |
 |---|---|---|---|---|---|
-| 1 | **F1**, array cache for `getBuiltInTypeName` | `SimpleTypesFactory` (about 20 LOC) | **None** | **done**, commit `8fa4a3f3a` (5a) | Monitor `0x...e973c7c8` off the hot path; contention 140109 -> **0**. |
+| 1 | **F1**, array cache for `getBuiltInTypeName` | `SimpleTypesFactory` (about 20 LOC) | **None** | **done**, commit `4dcbd52ca` (5a) | Monitor `0x...e973c7c8` off the hot path; contention 140109 -> **0**. |
 | 2 | **F3a**, hide `builtInTypeName` from JXPath | JXPath fork plus 1 start-up line | Low | **done**, commit `5ed7f7f4` (5b) | Reflective probe 96000 -> **0** invocations. |
-| 3 | **F2**, `ConcurrentHashMap` plus single init | `SimpleTypesFactory` | Low | **done**, working tree (5c) | Name lookups lock-free (41974 -> **0** blocks); construction ~108000x cheaper; two latent bugs fixed. |
-| 3b | **F2c**, de-`Hashtable` the `Schema` fields | `Schema` | Low | deferred (5c) | Removes the remaining per-instance lock hot spots during schema parsing. |
-| 4 | **F4**, JXPath hardening and memoization | `commons-jxpath` fork | Medium | open | Protects against the next getter with the same shape. |
+| 3 | **F2**, `ConcurrentHashMap` plus single init | `SimpleTypesFactory` | Low | **done**, commit `9d614be89` (5c) | Name lookups lock-free (41974 -> **0** blocks); construction ~108000x cheaper; two latent bugs fixed. |
+| 3b | **F2c**, de-`Hashtable` the `Schema` fields | `Schema` | Low | **done**, commit `8d6ba2df0` (5d) | Per-instance lock hot spots removed during schema parsing (3229 -> **0** blocks). |
+| 4 | **F4-1**, allocation-free indexed probe | `commons-jxpath` fork | **None** | **done**, commit `0164c1e1` (5e) | Garbage per probe 641464 -> **255912** bytes; closes a total test gap. |
+| 4b | **F4-2**, configurable cap | `commons-jxpath` fork | **None** at default | open | Gives ops a lever without a code change. |
+| 4c | **F4-3**, opt-in null-run early exit | `commons-jxpath` fork | Low (opt-in) | open | Protects against the next reference-valued getter with the same shape. |
+| 4d | ~~F4-4 / F4-5~~, class-scoped memoization and debug logging | - | - | **rejected** | Unsound and against the library's design; see F4. |
 | 5 | **F5**, expression and model redesign | Engine | Medium/High | open | Structural fix; biggest long-term win. |
 
 Steps 1 and 2 are independent and complementary: F1 makes the getter cheap and lock-free, F3a
@@ -720,13 +970,23 @@ stops it from being called at all.
 
 ### Outstanding integration work
 
-F1 and F3a are committed in the libraries, but the benefit only reaches production once:
+Five fixes are committed in the two libraries, but none of them reaches production until the
+artifacts are released and the engine picks them up:
 
-1. the patched `castor` artifact is released and the engine picks up the new version;
-2. the patched `commons-jxpath` fork is released and the engine picks up the new version;
-3. the engine start-up code calls `JXPathIntrospector.registerFilteredClass(...)` as shown in 5b.
+| Artifact | Carries | Effect once deployed |
+|---|---|---|
+| `castor` | F1 (`4dcbd52ca`), F2 (`9d614be89`), F2c (`8d6ba2df0`) | The contended monitor `0x...e973c7c8` disappears; schema lookups become lock-free; two latent bugs fixed. |
+| `commons-jxpath` fork | F3a (`5ed7f7f4`), F4-1 (`0164c1e1`) | `registerFilteredClass` becomes available; the indexed probe allocates 2,5x less. |
 
-Step 3 is the only application-side code change required.
+Then, on the application side:
+
+1. release the patched `castor` artifact and bump the engine to it;
+2. release the patched `commons-jxpath` fork and bump the engine to it;
+3. call `JXPathIntrospector.registerFilteredClass(...)` once at engine start-up, as shown in 5b.
+
+**Step 3 is the only application-side code change required**, and it is the one that actually
+stops the 96000 reflective calls. Steps 1 and 2 alone make the bottleneck cheap; step 3 removes
+it.
 
 ## 7. Verification
 
@@ -738,9 +998,12 @@ than a hang or deadlock.
 
 1. No thread dump contains `SimpleTypesFactory.getType` in a `BLOCKED` state.
 2. `-XX:+PrintConcurrentLocks` or JFR `jdk.JavaMonitorEnter` events show no hot monitor on
-   `SimpleTypesFactory`.
-3. Async-profiler shows `ValueUtils.getIndexedPropertyLength` below noise level, and `Integer`
-   boxing allocations from that frame at zero.
+   `SimpleTypesFactory` (F1, F2) and none on the per-instance maps of `Schema` (F2c).
+3. Async-profiler shows `ValueUtils.getIndexedPropertyLength` below noise level. Note this frame
+   should be **absent entirely** once the application calls `registerFilteredClass` (F3a); if it
+   is still present, step 3 of the integration work has not been done. F4-1 only makes the frame
+   cheaper, it does not remove it: allocation from it drops by about 2,5x but does not reach zero,
+   because indices at or above 128 still box an `Integer`.
 4. **Do not look for a log message.** The `JXPathException` raised by the exhausted probe is
    swallowed by `PropertyIterator.getLength()` and dropped by `NodePointer.handle()`
    (section 4.2b), so the condition is invisible in logs both before *and* after the fix. Use the
@@ -763,12 +1026,15 @@ up with the thread dump.
 | `castor/schema/.../Schema.java` | 94 | `static SimpleTypesFactory`, one per JVM |
 | `castor/schema/.../Schema.java` | 866-868 | indexed-getter-shaped public API |
 | `castor/schema/.../Schema.java` | 108-114 | further `Hashtable` fields |
+| `castor/schema/.../Schema.java` | 108-197, 1300 (post-F2c) | nine `ConcurrentHashMap` fields; `getSimpleTypes()` without `Hashtable.elements()` |
 | `castor/schema/.../{XMLType,ElementDecl,AttributeDecl,ModelGroup,AttributeGroupDecl,Wildcard}.java` | `getSchema()` | makes `Schema` reachable and the graph cyclic |
 | `commons-jxpath/.../util/ValueUtils.java` | 45 | `UNKNOWN_LENGTH_MAX_COUNT = 16000` |
 | `commons-jxpath/.../util/ValueUtils.java` | 108-132 | the probe loop |
+| `commons-jxpath/.../util/ValueUtils.java` | 113-143, 457, 501 (post-F4-1) | the probe with its hoisted argument array; `Integer.valueOf` on the reflective indexed path |
 | `commons-jxpath/.../ri/model/beans/BeanPropertyPointer.java` | 195-212 | `getLength()` routes indexed properties into the probe |
 | `commons-jxpath/.../ri/model/beans/PropertyIterator.java` | 139, 206, 311-325 | `getLength()` per property per bean; **swallows** the exception |
 | `commons-jxpath/.../ri/model/NodePointer.java` | 818-835 | `handle(Throwable)` drops it when no handler is installed |
 | `commons-jxpath/.../JXPathIntrospector.java` | 69-71, 107-120, 167-187 | registration hooks; `registerFilteredClass` added here |
 | `commons-jxpath/.../JXPathFilteredBeanInfo.java` | all | **F3a** implementation |
+| `commons-jxpath/.../util/ValueUtilsIndexedPropertyLengthTest.java` | all | **F4-1** verification, and the first direct test of the probe |
 
