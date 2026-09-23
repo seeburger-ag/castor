@@ -23,6 +23,7 @@ import java.beans.PropertyDescriptor;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
+import java.util.Hashtable;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -34,6 +35,11 @@ import org.junit.Test;
  * Verifies improvement <b>F1</b>: {@link SimpleTypesFactory#getBuiltInTypeName(int)} is served from
  * a lock-free lookup table instead of the process-wide {@code synchronized}
  * {@link java.util.Hashtable} {@code _typesByCode}.
+ * <p>
+ * <b>Note.</b> {@code _typesByCode} has since been turned into a
+ * {@link java.util.concurrent.ConcurrentHashMap} by improvement <b>F2</b>, so the "before"
+ * baseline used here is a local {@link Hashtable} replica rather than the live field. See
+ * {@code SimpleTypesFactoryInitialisationTest} for the F2 verification.
  * <p>
  * <b>Why this matters.</b> {@code String Schema.getBuiltInTypeName(int)} accidentally matches the
  * JavaBeans <em>indexed getter</em> pattern, and there is no companion {@code String[]
@@ -68,10 +74,22 @@ public class SimpleTypesFactoryLockFreeLookupTest {
 
   private static SimpleTypesFactory factory;
 
-  /** The pre-F1 implementation: boxed key + {@code synchronized} {@link java.util.Hashtable}. */
+  /**
+   * Replica of the pre-F1 storage: a {@link Hashtable} keyed by boxed type codes.
+   * <p>
+   * This deliberately does <em>not</em> use the live {@code _typesByCode} field. Improvement
+   * <b>F2</b> turned that field into a {@link java.util.concurrent.ConcurrentHashMap}, so it no
+   * longer locks - using it here would silently turn the "before" baseline into a second "after"
+   * measurement and the comparison below would become meaningless. Holding our own
+   * {@link Hashtable} keeps this test an honest, stable record of what F1 improved upon.
+   */
+  private static final Hashtable<Integer, Type> LEGACY_TYPES_BY_CODE =
+      new Hashtable<Integer, Type>();
+
+  /** The pre-F1 implementation: boxed key + {@code synchronized} {@link Hashtable}. */
   private static final NameLookup LEGACY_HASHTABLE_LOOKUP = new NameLookup() {
     public String name(final int code) {
-      Type type = factory.getType(code);
+      Type type = LEGACY_TYPES_BY_CODE.get(Integer.valueOf(code));
       if (type == null) {
         return null;
       }
@@ -94,6 +112,16 @@ public class SimpleTypesFactoryLockFreeLookupTest {
     new Schema();
     factory = Schema.getTypeFactory();
     assertNotNull("Schema must expose its shared SimpleTypesFactory", factory);
+
+    // -- mirror the live type table into the legacy Hashtable used as the "before" baseline.
+    for (int code = 0; code <= SimpleTypesFactory.ANYSIMPLETYPE_TYPE; code++) {
+      Type type = factory.getType(code);
+      if (type != null) {
+        LEGACY_TYPES_BY_CODE.put(Integer.valueOf(code), type);
+      }
+    }
+    assertTrue("the legacy baseline must mirror the built-in types",
+        LEGACY_TYPES_BY_CODE.size() > 40);
   }
 
   // ------------------------------------------------------------------------------------------
