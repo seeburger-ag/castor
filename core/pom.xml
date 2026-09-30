@@ -11,10 +11,27 @@
     </parent>
 
 
-    <packaging>jar</packaging>
+    <packaging>bundle</packaging>
 
     <name>Castor CORE - Core code/functionality</name>
     <description>Core functionality - Required by all other modules</description>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.felix</groupId>
+                <artifactId>maven-bundle-plugin</artifactId>
+                <extensions>true</extensions>
+                <configuration>
+                    <instructions>
+                        <_exportcontents>org.exolab*,org.castor*</_exportcontents>
+                        <_nouses>true</_nouses>
+                        <_noee>true</_noee>
+                    </instructions>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 
     <dependencies>
 
